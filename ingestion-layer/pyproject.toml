@@ -1,0 +1,41 @@
+[project]
+name = "ingestion-layer"
+version = "0.1.0"
+description = "GTA Hub ingestion pipeline — scrapes, extracts, and deduplicates game guide data"
+requires-python = ">=3.12"
+dependencies = [
+    "praw>=7.7.0",                    # Reddit API
+    "youtube-transcript-api>=0.6.0",  # YouTube captions
+    "feedparser>=6.0.0",              # RSS/Atom feeds
+    "pydantic>=2.0.0",                # Data validation & serialization
+    "python-dotenv>=1.0.0",           # .env file loading
+    "google-generativeai>=0.7.0",     # Google Gemini API for extraction
+    "sentence-transformers>=2.5.0",   # Local embeddings for dedup
+    "requests>=2.31.0",               # HTTP fallback
+    "pydantic-settings>=2.0.0",       # Settings loader for config.py
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ingestion"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
