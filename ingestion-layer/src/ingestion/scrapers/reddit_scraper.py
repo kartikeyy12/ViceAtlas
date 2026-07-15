@@ -7,14 +7,17 @@ WHAT THIS FILE DOES:
 
 TWO MODES:
     1. CATCH-UP MODE (for testing): Pulls last N days of posts.
-       Controlled by CATCHUP_DAYS in .env.
-    2. INCREMENTAL MODE (for cron): Only fetches posts newer than the last
-       stored cursor (a post ID or timestamp saved to disk).
+    2. INCREMENTAL MODE (for cron): Only fetches posts newer than the last cursor.
+
+COMMENT DEPTH:
+    - Grabs top N comments per post (default 10).
+    - Grabs up to M nested replies per comment (default 5).
+    - Edit TOP_COMMENTS and MAX_REPLIES_PER_COMMENT below to change this.
 
 RATE LIMITS / COST:
-    - Reddit's API limit: 60 requests/minute for OAuth apps.
-    - PRAW handles rate limiting automatically (it sleeps when needed).
-    - No cost — Reddit API is free for read-only access.
+    - Reddit API: 60 requests/minute for OAuth apps.
+    - PRAW handles rate limiting automatically.
+    - More comments/replies = more API calls = slower runs.
 
 HOW TO RUN:
     uv run scripts/run_reddit_test.py
@@ -24,10 +27,9 @@ HOW TO SWITCH TO GTA 6 LATER:
 """
 
 import json
-import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
 import praw
 
@@ -36,15 +38,18 @@ from ingestion.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# =============================================================================
+# TWEAK THESE NUMBERS WITHOUT DIGGING INTO THE CODE
+# =============================================================================
+TOP_COMMENTS = 10           # How many top-level comments to grab per post
+MAX_REPLIES_PER_COMMENT = 5 # How many nested replies per comment (0 = disable replies)
+
 # Where we store the "last seen" cursor for incremental runs
 _CURSOR_FILE = Path(__file__).resolve().parent.parent.parent.parent / "data" / "raw" / ".reddit_cursor"
 
 
 def _get_reddit_client() -> praw.Reddit:
-    """
-    Creates an authenticated Reddit client using credentials from .env.
-    PRAW handles OAuth and rate limiting internally.
-    """
+    """Creates an authenticated Reddit client using credentials from .env."""
     return praw.Reddit(
         client_id=settings.reddit_client_id,
         client_secret=settings.reddit_client_secret,
@@ -53,10 +58,7 @@ def _get_reddit_client() -> praw.Reddit:
 
 
 def _load_cursor() -> datetime | None:
-    """
-    Reads the timestamp of the last successful run from disk.
-    Returns None if no cursor exists (first run).
-    """
+    """Reads the timestamp of the last successful run from disk."""
     if not _CURSOR_FILE.exists():
         return None
     timestamp_str = _CURSOR_FILE.read_text().strip()
@@ -69,21 +71,59 @@ def _save_cursor(dt: datetime) -> None:
     _CURSOR_FILE.write_text(dt.isoformat())
 
 
-def _post_to_dict(post: praw.models.Submission) -> dict:
+def _comment_to_dict(comment: praw.models.Comment) -> dict[str, Any]:
+    """
+    Converts a single PRAW Comment (top-level or reply) into a clean dict.
+    This is reused for both top-level comments and nested replies.
+    """
+    return {
+        "body": comment.body,
+        "author": str(comment.author) if comment.author else "[deleted]",
+        "score": comment.score,
+        "created_utc": datetime.fromtimestamp(comment.created_utc, tz=timezone.utc).isoformat(),
+    }
+
+
+def _fetch_replies(comment: praw.models.Comment, max_replies: int) -> list[dict[str, Any]]:
+    """
+    Fetches nested replies to a single comment, up to max_replies.
+    Returns an empty list if the comment has no replies or if max_replies is 0.
+    """
+    if max_replies <= 0:
+        return []
+
+    # comment.replies is a list of Comment objects (or MoreComments stubs)
+    # We filter out stubs and only take real comments
+    real_replies = [
+        c for c in comment.replies
+        if isinstance(c, praw.models.Comment)
+    ]
+
+    return [
+        _comment_to_dict(reply)
+        for reply in real_replies[:max_replies]
+    ]
+
+
+def _post_to_dict(post: praw.models.Submission) -> dict[str, Any]:
     """
     Converts a PRAW Submission object into a plain Python dict.
-    This is what gets saved as raw JSON.
+    Includes top N comments + up to M nested replies per comment.
     """
-    # PRAW lazily loads comments — force fetch top-level ones
-    post.comments.replace_more(limit=0)  # remove "load more" stubs
-    top_comments = [
-        {
-            "body": c.body,
-            "author": str(c.author) if c.author else "[deleted]",
-            "score": c.score,
-        }
-        for c in post.comments[:5]  # top 5 comments only
-    ]
+    # Force PRAW to load real comments instead of "load more" stubs
+    post.comments.replace_more(limit=0)
+
+    comments_data: list[dict[str, Any]] = []
+    for comment in post.comments[:TOP_COMMENTS]:
+        # Skip any remaining stubs (safety check)
+        if not isinstance(comment, praw.models.Comment):
+            continue
+
+        comment_dict = _comment_to_dict(comment)
+        # Attach nested replies
+        comment_dict["replies"] = _fetch_replies(comment, MAX_REPLIES_PER_COMMENT)
+
+        comments_data.append(comment_dict)
 
     return {
         "source": "reddit",
@@ -91,13 +131,13 @@ def _post_to_dict(post: praw.models.Submission) -> dict:
         "source_url": f"https://reddit.com{post.permalink}",
         "subreddit": str(post.subreddit),
         "title": post.title,
-        "body": post.selftext,  # empty for link posts, text for self posts
+        "body": post.selftext,
         "author": str(post.author) if post.author else "[deleted]",
         "score": post.score,
         "upvote_ratio": post.upvote_ratio,
         "num_comments": post.num_comments,
         "created_utc": datetime.fromtimestamp(post.created_utc, tz=timezone.utc).isoformat(),
-        "top_comments": top_comments,
+        "top_comments": comments_data,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -106,7 +146,7 @@ def fetch_posts(
     subreddits: list[str] | None = None,
     mode: str = "catchup",
     limit: int | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Main entry point. Fetches posts from configured subreddits.
 
@@ -121,11 +161,14 @@ def fetch_posts(
     client = _get_reddit_client()
     subs = subreddits or settings.subreddit_list
     max_items = limit or settings.test_mode_limit
-    posts: list[dict] = []
+    posts: list[dict[str, Any]] = []
 
-    logger.info("Fetching Reddit posts from: %s | mode=%s | limit=%d", subs, mode, max_items)
+    logger.info(
+        "Fetching Reddit posts from: %s | mode=%s | limit=%d | top_comments=%d | max_replies=%d",
+        subs, mode, max_items, TOP_COMMENTS, MAX_REPLIES_PER_COMMENT,
+    )
 
-    # Calculate the cutoff time
+    # Calculate cutoff time
     if mode == "catchup":
         cutoff = datetime.now(timezone.utc) - timedelta(days=settings.catchup_days)
         logger.info("Catch-up mode: fetching posts since %s", cutoff.isoformat())
@@ -142,7 +185,7 @@ def fetch_posts(
         subreddit = client.subreddit(sub_name)
 
         # Sort by "new" so we can stop once we hit the cutoff
-        for post in subreddit.new(limit=max_items * 3):  # fetch extra to filter by date
+        for post in subreddit.new(limit=max_items * 3):
             post_time = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
 
             if post_time < cutoff:
@@ -156,9 +199,7 @@ def fetch_posts(
                 break
 
     if posts:
-        newest = max(
-            datetime.fromisoformat(p["created_utc"]) for p in posts
-        )
+        newest = max(datetime.fromisoformat(p["created_utc"]) for p in posts)
         _save_cursor(newest)
         logger.info("Saved cursor at %s", newest.isoformat())
 
@@ -166,7 +207,7 @@ def fetch_posts(
     return posts
 
 
-def save_raw_posts(posts: list[dict], output_dir: Path | None = None) -> Path:
+def save_raw_posts(posts: list[dict[str, Any]], output_dir: Path | None = None) -> Path:
     """
     Saves the raw post list to a timestamped JSON file in data/raw/.
     Returns the path to the saved file.
