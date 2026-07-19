@@ -129,7 +129,8 @@ def fetch_transcript(video_id: str, correct: bool = True) -> dict | None:
     logger.info("Fetching transcript for video %s", vid)
 
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(vid)
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.fetch(vid)
     except (TranscriptsDisabled, NoTranscriptFound) as e:
         logger.warning("No transcript for %s: %s", vid, e)
         return None
@@ -138,7 +139,7 @@ def fetch_transcript(video_id: str, correct: bool = True) -> dict | None:
         return None
 
     # Concatenate all transcript segments with timestamps
-    raw_text = " ".join(segment["text"] for segment in transcript_list)
+    raw_text = " ".join(segment.text for segment in transcript_list)
     full_text = _correct_transcript(raw_text) if correct else raw_text
 
     return {
@@ -148,7 +149,7 @@ def fetch_transcript(video_id: str, correct: bool = True) -> dict | None:
         "title": None,  # would need YouTube Data API v3 for title
         "transcript_raw": raw_text,
         "transcript_corrected": full_text,
-        "language": transcript_list[0].get("language", "unknown") if transcript_list else "unknown",
+        "language": "en",
         "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
 
